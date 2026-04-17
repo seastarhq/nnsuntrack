@@ -1,0 +1,1 @@
+llama-cli -m ~/.cache/llama.cpp/Qwen_Qwen3-32B-GGUF_Qwen3-32B-Q8_0.gguf  -ngl 36 -f ~steve/nasa/seastar/neuralnet_images/prompt1.txt

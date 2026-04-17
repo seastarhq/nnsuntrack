@@ -1,0 +1,10 @@
+*.keras
+*.tflite
+*.png
+share/
+lib/
+lib64
+bin/
+synthetic_images/
+pyvenv.cfg
+

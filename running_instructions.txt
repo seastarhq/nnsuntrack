@@ -1,0 +1,118 @@
+Sun Tracker CNN - Running Instructions
+=======================================
+
+The project directory is a Python venv. Activate it first:
+
+    cd /home/steve/nasa/neuralnet/neuralnet1
+    source bin/activate
+
+
+-----------------------------------------------------------
+STEP 1 - Generate synthetic training data
+-----------------------------------------------------------
+
+    python synthetic_data_script.py \
+        --num_images 20000 \
+        --output_dir ./synthetic_images
+
+Key flags (all optional, defaults match the Arducam 800x600):
+  --num_images          Count of scenes to generate. Start with ~1000 for
+                        a smoke test; use tens of thousands for a real run.
+  --image_width         Source resolution (default 800).
+  --image_height        Source resolution (default 600).
+  --min_size            Sun/reflection radius range in pixels
+  --max_size             (default 20 - 100).
+  --sun_brightness      Scene appearance.
+  --background_brightness
+  --noise_stddev
+  --output_dir          Writes PNGs + metadata.csv.
+
+Scene mix (fixed in code): 30% clear sun, 20% sun+reflections,
+15% reflection-only, 15% occluded sun, 10% occluded sun + reflections,
+10% empty.
+
+
+-----------------------------------------------------------
+STEP 2 - Train the model
+-----------------------------------------------------------
+
+    python training_script.py \
+        --data_dir ./synthetic_images \
+        --epochs 50 \
+        --batch_size 32 \
+        --output_model sun_detector_model.keras \
+        --output_tflite sun_detector_model.tflite
+
+Key flags:
+  --data_dir            Where synthetic_data_script.py wrote its output.
+  --input_width         CNN input size (default 256).
+  --input_height        CNN input size (default 192).
+                        For fisheye cameras, bump these up to meet the
+                        sub-pixel accuracy requirement at 140 deg FOV.
+  --epochs              Default 20.
+  --batch_size          Default 32.
+  --validation_split    Default 0.2.
+
+Produces both .keras (for re-training / analysis) and .tflite (for
+deployment).
+
+Train on the workstation, not the RPi5.
+
+
+-----------------------------------------------------------
+STEP 3 - Deploy / run inference
+-----------------------------------------------------------
+
+On the workstation (for validation; falls back to tensorflow.lite):
+
+    python deployment_script.py \
+        --image_path ./synthetic_images/image_0.png \
+        --model_path sun_detector_model.tflite \
+        --confidence_threshold 0.5
+
+On the RPi5, copy sun_detector_model.tflite and deployment_script.py
+over, then install tflite_runtime:
+
+    pip install tflite-runtime opencv-python numpy
+    python deployment_script.py \
+        --image_path /tmp/frame.png \
+        --model_path sun_detector_model.tflite \
+        --num_threads 4
+
+Output is one line per call:
+  confidence=0.987 centroid=(412.35, 298.71) pixels    -- detection
+  confidence=0.142 (below threshold); no sun detection -- NaN centroid,
+                                                          ROS2 node
+                                                          should fall
+                                                          back to
+                                                          ephemeris
+
+
+-----------------------------------------------------------
+Importing from a ROS2 node
+-----------------------------------------------------------
+
+deployment_script.py exposes two functions for the ROS2 wrapper:
+
+    from deployment_script import load_model, run_inference
+
+    interp = load_model('sun_detector_model.tflite', num_threads=4)
+    # per frame, per camera (sequential across the 5 cameras):
+    confidence, cx, cy = run_inference(
+        interp, grayscale_image, confidence_threshold=0.5)
+
+Coordinates are in the *source image* frame (un-normalized by the actual
+image dims, not the model input), so the resize is transparent to the
+caller. cx / cy can be negative or exceed the frame size when the sun is
+partially off-frame; they are NaN when confidence is below threshold.
+
+
+-----------------------------------------------------------
+Quick smoke test end-to-end
+-----------------------------------------------------------
+
+    python synthetic_data_script.py --num_images 400 \
+        --output_dir ./synthetic_images
+    python training_script.py --data_dir ./synthetic_images --epochs 5
+    python deployment_script.py \
+        --image_path ./synthetic_images/image_0.png

@@ -1,0 +1,311 @@
+Sun Tracker CNN - Design & Implementation Chat Transcript
+===========================================================
+Date: 2026-04-15
+Project: /home/steve/nasa/neuralnet/neuralnet1
+
+This transcript captures the design interview and subsequent implementation
+of a CNN-based sun tracker intended for real-time (50 Hz) inference on a
+Raspberry Pi 5, feeding a ROS2 robot control loop.
+
+
+==================================================================
+PART 1 - INTERVIEW ABOUT PURPOSE AND REQUIREMENTS
+==================================================================
+
+USER: interview me about the purpose of the code in this folder
+
+ASSISTANT: Reviewed the code: a three-stage ML pipeline -
+synthetic_data_script.py, training_script.py, deployment_script.py - for
+detecting the sun and outputting its centroid, with deployment on a
+Raspberry Pi 5 via TensorFlow Lite. Asked:
+  1. What broader system is consuming the centroid output?
+  2. Why synthetic data instead of real imagery?
+  3. What's the physical setup (camera, field of view, platform)?
+  4. What "bright non-sun" objects appear in the real scene?
+  5. Accuracy and latency requirements?
+
+USER:
+  1. Sun tracker, centroid feeds a ROS2 robot control system.
+  2. Synthetic data is expected to be sufficient. Ellipses model
+     lens/atmospheric distortion. Polygons model specular reflections that
+     should be rejected as non-sun.
+  3. Raspberry Pi 5 with Arducam. Plan: 5 cameras for hemispheric FOV.
+     Ground-based.
+  4. Specular reflections off the robot frame, lens flare.
+  5. 50 Hz frame rate, sub-pixel centroid accuracy, real-time control loop.
+
+ASSISTANT asked:
+  6. Benchmarked the existing model on RPi5?
+  7. Camera native resolution and exact accuracy target?
+  8. 5-camera plan: one RPi5 per camera, or all on one board?
+  9. Can sun and reflection appear in the same frame simultaneously?
+  10. Is the downstream ROS2 node already built?
+
+USER:
+  6. No benchmarking yet.
+  7. Arducam 800x600, 30-degree FOV, need 0.1 degrees of accuracy.
+  8. 5 cameras on one board, inference runs on one camera at a time.
+  9. Yes - sun (circular) plus reflections (non-circular) can coexist.
+  10. ROS2 node exists. Currently fed by a brightest-pixel algorithm
+      (non-CNN), publishes to a topic.
+
+ASSISTANT did the accuracy math: 30 deg over 800 px = 0.0375 deg/px at
+native; 0.1 deg ~= 2.7 px. At the training input of 256x256, each pixel
+spans ~0.117 deg so the model needs sub-pixel accuracy at the training
+resolution to meet 0.1 deg. Asked further:
+  11. Is the CNN a drop-in replacement for the brightest-pixel publisher?
+  12. Do we need multi-object training scenes (sun + reflection)?
+  13. How will camera selection work? Ephemeris?
+  14. What happens when the sun is occluded/clouded?
+
+USER:
+  11. Drop-in replacement, same topic.
+  12. Yes, generate multi-object training data.
+  13. ROS2 knows sun position from ephemeris. Would be useful to have a
+      lower-framerate scan across cameras to identify which sees the sun.
+  14. Confidence score is a good way to handle this. Generate training
+      data with occluded sun (thin clouds, partial blockage).
+
+ASSISTANT noted the fisheye change (30 deg on some cameras, 140 deg on
+others) and asked:
+  15. Are raw fisheye images fed to the CNN, or undistorted first?
+  16. Replace binary is_sun with continuous confidence, or add it?
+  17. What does synthetic "occluded sun" look like?
+  18. Is the cross-camera scan done by the CNN or a separate check?
+
+USER:
+  15. Undistorted first.
+  16. Replace is_sun with confidence. Control node stops tracking below
+      some confidence threshold.
+  17. Dimmer diffuse (thin cloud) and partial-circle (cloud edge) are both
+      fine.
+  18. Lightweight CNN pass on all 5 cameras works. Camera ID becomes a
+      4th output value.
+
+ASSISTANT asked:
+  19. Single model that picks a camera, or separate scan + full model?
+  20. How much training data? Training hardware?
+  21. What should the control node do under low confidence?
+  22. How will the real system be validated?
+
+USER:
+  19. One system: [confidence, camera_id, centroid_x, centroid_y].
+  20. Training image count is a variable; expect tens of thousands.
+      Train on a workstation.
+  21. Go to ephemeris-predicted position. Report low confidence and NaN
+      centroid for "no detection."
+  22. Point at the real sun. Scan across the CNN-inferred centroid with a
+      narrow-FOV radiometer to cross-check.
+
+ASSISTANT raised design questions:
+  23. Multi-camera: run inference on each camera in sequence, or take all
+      5 as simultaneous input?
+  24. Camera_id: handled by the model or by the ROS2 node?
+  25. Plan of attack for code changes?
+
+USER:
+  23. Sequential inference on each camera.
+  24. Camera_id handled in ROS2 node.
+  25. Synthetic data script, then training, then deployment. In that
+      order.
+
+
+==================================================================
+PART 2 - SYSTEM DESIGN (SUMMARY OF AGREED APPROACH)
+==================================================================
+
+Hardware
+  - Raspberry Pi 5 with up to 5 Arducam cameras (800x600)
+  - Some cameras ~30 deg FOV, others ~140 deg fisheye; images will be
+    undistorted before inference
+  - 50 Hz camera frame rate; inference must match
+
+Model output (per camera, one inference at a time)
+  [confidence, centroid_x_normalized, centroid_y_normalized]
+  - Confidence is continuous [0, 1]: 1.0 clear sun, occlusion factor for
+    occluded sun, 0.0 no sun
+  - Centroid is normalized by source image dimensions. May be outside
+    [0, 1] when the sun is partially off-frame.
+  - NaN centroid + low confidence means "no fix" -> control node falls
+    back to ephemeris
+
+ROS2 node selects highest-confidence camera from the 5 and publishes:
+  [confidence, camera_id, centroid_x, centroid_y]
+
+Training data (synthetic) must include:
+  - Clear sun (circle/ellipse)
+  - Reflections (polygons) that must be rejected
+  - Multi-object scenes (sun + reflections in same frame)
+  - Occluded sun - thin cloud (dimmer + diffuse) and partial (cloud edge)
+  - Empty scenes (no sun, no reflections)
+  - Sun centroids that may lie outside the frame boundaries
+
+
+==================================================================
+PART 3 - IMPLEMENTATION
+==================================================================
+
+STEP 1: synthetic_data_script.py (rewritten)
+
+Added:
+  - Scene sampler with 6 categories:
+      sun_only, reflection_only, sun_and_reflections,
+      occluded_sun, occluded_sun_and_reflections, empty
+  - Two occlusion modes:
+      thin_cloud: sun drawn dimmer + Gaussian blur. confidence = cloud
+        factor (0.2-0.7).
+      partial: full-brightness sun cut by a half-plane occluder at a
+        random angle. confidence = visible fraction (0.3-0.8).
+  - Multi-object scenes: 1-3 reflections can coexist with or without sun.
+  - Continuous confidence label replaces binary is_sun.
+  - NaN centroid when no sun present.
+  - scene_type stored in metadata for debugging.
+  - Noise bug fix: int16 intermediate avoids uint8 wraparound on negative
+    samples.
+
+CLI change #1: replaced --image_size with --image_width and
+--image_height (defaults 800 and 600 matching Arducam). Numpy array
+shape is (height, width); centroid_x ranges over width; partial-occlusion
+extent uses max(width, height) * 2.
+
+Design iteration on partial occlusion:
+  - Initial formula: d = sun_radius * (2 * visible_fraction - 1). That
+    inverted the relationship - an image labeled visible_fraction=0.76
+    actually showed ~24 percent of the sun.
+  - Fix: d = sun_radius * (1 - 2 * visible_fraction). d < 0 puts the sun
+    center on the visible side; d > 0 puts it in the occluded half.
+  - Verified visually: an image labeled 0.53 shows a clean half-occluded
+    sun.
+
+CLI change #2 (per user request): allow the sun centroid to fall outside
+the frame. Refactored draw_sun to take major_axis as an explicit
+parameter so generate_scene can pick the size first and then sample
+centroid from [-sun_radius, image_dim + sun_radius]. About 1/3 of sun
+scenes now have centroids outside the frame; training examples cover
+"sun fully in frame" through "sun barely peeking over the edge."
+
+
+STEP 2: training_script.py (rewritten)
+
+  - Removed stray "python" line (markdown artifact).
+  - Loss function now handles continuous confidence (BCE on [0, 1]
+    targets) and uses a has_sun mask to zero out centroid loss for no-sun
+    scenes - placeholder-zero centroids should not pull the regression
+    head toward the origin.
+  - Label format is [confidence, cx_norm, cy_norm, has_sun]. Model still
+    outputs 3 values; the 4th is a mask used only in the loss.
+  - Data loader infers original image resolution from the first image in
+    the dataset. Centroids are normalized by that original size, so model
+    outputs are invariant to the training input resolution.
+  - Training input size decoupled from source image size via
+    --input_width (default 256) and --input_height (default 192) -
+    images are resized on load.
+  - Added --epochs, --batch_size, --validation_split CLI flags.
+  - Confidence output is a linear logit; sigmoid is applied in the loss
+    (and at deployment).
+  - Centroid outputs are unbounded so they can represent off-frame suns.
+  - Output format switched from legacy .h5 to native .keras.
+  - TFLite conversion routed through an in-memory tf.function concrete
+    function because from_keras_model is broken under Keras 3, and the
+    SavedModel-based route trips a Python 3.14 TrackableView bug in this
+    environment.
+  - Added scikit-learn dependency install (was missing in the venv).
+
+First training run (before architecture change) produced a 100 MB TFLite
+model at 268 M MACs per inference - far too heavy for the 50 Hz/20 ms
+budget on the RPi5. Flagged for redesign.
+
+
+STEP 3: Model architecture redesign (training_script.create_model)
+
+User: change the architecture of the model to allow it to run on a Rpi5.
+
+Old architecture
+  Conv(32) -> Pool -> Conv(64) -> Pool -> Flatten (196K features)
+    -> Dense(128) -> Dense(3)
+  25 M params, 268 M MACs, 100 MB TFLite. Flatten+Dense(128) bottleneck
+  alone was 25 M params.
+
+New architecture
+  Shared trunk: four stride-2 convs (cheaper than conv+maxpool):
+    Conv(16, s=2) -> Conv(24, s=2) -> Conv(32, s=2) -> Conv(32, s=2)
+    192x256 -> 96x128 -> 48x64 -> 24x32 -> 12x16
+  Confidence head (position-invariant):
+    GlobalAveragePool -> Dense(1, linear)
+  Centroid head (position-sensitive):
+    Conv(8, 1x1) -> Flatten -> Dense(32, relu) -> Dense(2, linear)
+    - The 1x1 conv is the key size lever: squeezes 32 channels to 8 so
+      the flatten is only 12*16*8 = 1536 features (vs. 6144), cutting
+      the following dense from 200K params to 49K.
+  Concat(confidence, centroid) -> 3 outputs
+
+Design rationale:
+  - Stride-2 convs do one op per stage instead of conv-then-pool.
+  - Progressive channel growth 16 -> 24 -> 32 -> 32 keeps compute lean.
+  - Split heads: GAP is ideal for "is there a sun" (position-invariant),
+    nearly free. Flatten preserves position info for sub-pixel centroid
+    regression.
+
+New budget:
+  69 K params, 19.7 M MACs, 282 KB TFLite.
+  370x smaller, 13x fewer MACs.
+  Workstation CPU inference: ~0.25 ms per frame at 4 threads.
+  Predicted RPi5 inference: 5-10 ms per frame (well under 20 ms).
+
+
+STEP 4: deployment_script.py (rewritten)
+
+  - Removed stray "python" line.
+  - Import fallback: prefers tflite_runtime.interpreter on RPi5; falls
+    back to tensorflow.lite on workstations for local validation.
+  - Reads model input shape from the TFLite file instead of requiring it
+    via CLI - decouples deployment from training resolution.
+  - Un-normalizes centroid by source image dimensions (not model input
+    dimensions) so coordinates are in the camera frame. Off-frame suns
+    produce negative values or values exceeding the frame size,
+    consistent with training.
+  - Continuous confidence: sigmoid applied to the raw logit.
+  - NaN semantics: when confidence < --confidence_threshold (default
+    0.5), centroid is NaN. The ROS2 node treats NaN as "no fix" and
+    falls back to ephemeris-predicted position.
+  - num_threads=4 default to use all RPi5 cores.
+  - load_model() and run_inference(interp, image, threshold) structured
+    for import by a ROS2 node; CLI is a convenience wrapper.
+
+Verified end-to-end: synthetic data -> train (5 epochs, 400 images) ->
+TFLite -> deployment_script.py inference. Below-threshold NaN output
+works correctly.
+
+
+==================================================================
+PART 4 - OPEN ITEMS / CONSIDERATIONS FOR REAL DEPLOYMENT
+==================================================================
+
+1. Real training: the user plans tens of thousands of images and many
+   epochs on a workstation. The smoke-test trained model predicted
+   near-center for everything - expected at 400 images / 5 epochs.
+
+2. Loss rebalancing: BCE and centroid MSE are roughly balanced now. If
+   centroid accuracy suffers in real training, add a weight to the MSE
+   term.
+
+3. Aspect ratio matching: deployment does a plain resize. If a new
+   camera has a different aspect ratio than training, wrap in letterbox
+   or center-crop logic.
+
+4. Model quantization: int8 TFLite quantization would shrink the model
+   ~4x further and often speeds RPi5 inference. Worth trying after
+   training is dialed in.
+
+5. Benchmark on RPi5: predicted 5-10 ms per frame, but confirm
+   empirically before committing to the 50 Hz loop.
+
+6. Multi-camera orchestration: the deployment_script is single-image.
+   The ROS2 node (or a wrapper) will need to sequence inference across
+   the 5 cameras and select the highest-confidence one.
+
+7. Accuracy math for fisheye: 0.1 deg at 800 px over 30 deg FOV is
+   ~2.7 px at native; over 140 deg fisheye it's ~0.57 px at native.
+   Verify sub-pixel requirement is achievable at training input
+   resolution (256x192) for fisheye cameras - may need higher
+   --input_width / --input_height there.
