@@ -1,0 +1,50 @@
+Dataset:    60000 images at 800x600  (./synthetic_images)
+Model:      sun_detector_model.tflite  (threads=4)
+Model input: 256x192
+
+=== Inference latency ===
+  samples:  500
+  mean:        0.25 ms
+  median:      0.23 ms
+  p95:         0.28 ms
+  p99:         0.34 ms
+  max:         0.50 ms
+  frames over 20 ms budget: 0/500 (0.0%)
+  steady-state throughput: 4074.1 Hz
+
+=== Binary detection (sun present vs absent) ===
+   threshold     TP    FP    FN    TN  precision  recall     F1
+       0.10   43919  2082  1021 12978      0.955   0.977  0.966
+       0.30   39976   140  4964 14920      0.997   0.890  0.940
+  *    0.50   35147    37  9793 15023      0.999   0.782  0.877
+       0.70   31625    12 13315 15048      1.000   0.704  0.826
+       0.90   27759     1 17181 15059      1.000   0.618  0.764
+  * = deployment threshold (see --confidence_threshold)
+
+=== Confidence calibration ===
+  mean abs error (all samples): 0.0803
+  pred range           n  mean_true  mean_pred
+  [0.00, 0.20)      17483      0.076      0.081
+  [0.20, 0.40)       4943      0.409      0.301
+  [0.40, 0.60)       4363      0.540      0.494
+  [0.60, 0.80)       3149      0.692      0.700
+  [0.80, 1.00)      30062      0.982      0.971
+
+=== Centroid accuracy (sun-present scenes, n=44940) ===
+  MAE:        38.24 px
+  RMSE:       68.57 px
+  median:     27.30 px
+  p95:        81.26 px
+  max:      1013.80 px
+       FOV   MAE deg   req. px   within 0.1 deg
+       30°     1.434      2.67             0.8%
+      140°     6.692      0.57             0.0%
+
+=== Per-scene-type breakdown ===
+  scene_type                           n   conf_MAE   centroid_MAE_px
+  empty                             5971      0.075                 -
+  occluded_sun                      9070      0.133             46.87
+  occluded_sun_and_reflections      6029      0.158             53.27
+  reflection_only                   9089      0.081                 -
+  sun_and_reflections              12062      0.060             34.74
+  sun_only                         17779      0.042             31.12
