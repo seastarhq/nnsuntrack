@@ -1,0 +1,93 @@
+Spatial Soft-Argmax CNN Training Results
+=========================================
+Date: 2026-04-16
+Architecture: 4x stride-2 conv blocks (16->24->32->32) with BatchNorm,
+              spatial soft-argmax centroid head, GAP confidence head
+Parameters: ~20K (down from ~70K)
+Input: 256x192 grayscale
+Dataset: 10,001 synthetic images (800x600), 80/20 train/val split
+Epochs: 50, Adam with cosine LR decay (1e-3 -> 1e-5), batch size 32
+Loss: BCE (confidence) + 5.0 * masked MSE (centroid)
+
+Command
+-------
+python training_script.py --epochs 50
+
+All other parameters used their defaults:
+  --data_dir=./synthetic_images
+  --input_width=256
+  --input_height=192
+  --batch_size=32
+  --validation_split=0.2
+  --output_model=sun_detector_model.keras
+  --output_tflite=sun_detector_model.tflite
+
+Training Loss Curve
+-------------------
+Epoch  1: loss=0.9466  val_loss=1.3352
+Epoch  5: loss=0.6272  val_loss=0.6574
+Epoch 10: loss=0.5252  val_loss=0.9377
+Epoch 15: loss=0.4735  val_loss=0.9342
+Epoch 20: loss=0.4137  val_loss=0.6152
+Epoch 25: loss=0.3698  val_loss=0.6350
+Epoch 30: loss=0.3262  val_loss=0.8357
+Epoch 35: loss=0.3000  val_loss=0.7314
+Epoch 40: loss=0.2861  val_loss=0.6417
+Epoch 45: loss=0.2771  val_loss=0.6346
+Epoch 50: loss=0.2745  val_loss=0.6264
+
+Model Size
+----------
+TFLite:  85 KB  (previously 276 KB, 3.3x smaller)
+Keras:  325 KB  (previously 874 KB)
+
+Inference Latency (500 samples, 4 threads)
+------------------------------------------
+Mean:     0.55 ms
+Median:   0.40 ms
+P95:      1.43 ms
+P99:      4.02 ms
+Max:      4.79 ms
+Over 20 ms budget: 0/500 (0.0%)
+Throughput: 1831.8 Hz
+
+Binary Detection (sun present vs absent)
+-----------------------------------------
+Threshold     TP    FP    FN    TN  Precision  Recall     F1
+     0.10   7432  1108    84  1376      0.870   0.989  0.926
+     0.30   6961   236   555  2248      0.967   0.926  0.946
+  *  0.50   6153   111  1363  2373      0.982   0.819  0.893
+     0.70   5378    52  2138  2432      0.990   0.716  0.831
+     0.90   4078    19  3438  2465      0.995   0.543  0.702
+* = deployment threshold
+
+Confidence Calibration
+----------------------
+Mean absolute error (all samples): 0.1084
+Pred range        n  mean_true  mean_pred
+[0.00, 0.20)   2342      0.048      0.088
+[0.20, 0.40)    909      0.329      0.298
+[0.40, 0.60)    935      0.503      0.498
+[0.60, 0.80)    838      0.705      0.707
+[0.80, 1.00)   4976      0.965      0.949
+
+Centroid Accuracy (sun-present scenes, n=7516)
+----------------------------------------------
+MAE:       46.26 px
+RMSE:      78.23 px
+Median:    34.29 px
+P95:       93.40 px
+Max:      776.43 px
+      FOV   MAE deg   req. px   within 0.1 deg
+      30°     1.735      2.67             0.4%
+     140°     8.096      0.57             0.0%
+
+Per-Scene-Type Breakdown
+------------------------
+Scene type                          n   conf_MAE   centroid_MAE_px
+empty                             996      0.132                 -
+occluded_sun                     1471      0.136             52.94
+occluded_sun_and_reflections     1035      0.143             62.27
+reflection_only                  1488      0.141                 -
+sun_and_reflections              2002      0.083             44.54
+sun_only                         3008      0.076             38.63

@@ -6,13 +6,15 @@ import cv2
 import argparse
 import tensorflow as tf
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import (Input, Conv2D, Flatten, Dense,
-                                      GlobalAveragePooling2D, Concatenate)
+from tensorflow.keras.layers import (Input, Conv2D, Dense,
+                                      GlobalAveragePooling2D, Concatenate,
+                                      Reshape, Activation, BatchNormalization,
+                                      Lambda)
 from sklearn.model_selection import train_test_split
 
 
 def create_model(input_shape):
-    """Compact CNN sized for real-time inference on a Raspberry Pi 5.
+    """Compact CNN with spatial soft-argmax for sub-pixel centroid accuracy.
 
     3 linear outputs: [confidence_logit, cx_norm, cy_norm]. Sigmoid is applied
     to the confidence channel in the loss (and at deployment). The two
@@ -20,40 +22,74 @@ def create_model(input_shape):
     lies outside the image frame (normalized values < 0 or > 1).
 
     Design notes:
-    - Stride-2 convs do the downsampling (cheaper than conv+maxpool and
-      trimmed of the redundant full-resolution conv at each stage).
+    - Stride-2 convs with BatchNorm do the downsampling. BN stabilizes
+      training and is fused into the preceding conv at TFLite export
+      (zero runtime cost). use_bias=False because BN's beta subsumes it.
     - Feature depth grows as spatial dims shrink: 16 → 24 → 32 → 32.
     - Two output heads share the feature trunk:
-        confidence: global average pool + linear. Spatial position doesn't
-                    matter for "is there a sun in frame", so GAP is the right
-                    aggregator - and it costs almost nothing.
-        centroid:   1x1 conv squeezes 32 channels to 8, then flatten + two
-                    dense layers. Position information is preserved through
-                    the flatten so the regression head can read feature
-                    activation at specific spatial locations, which is what
-                    sub-pixel centroid accuracy needs.
-    - With a 256x192 input this is ~70K params and ~20M MACs, vs. the
-      previous ~25M params / ~268M MACs.
+        confidence: global average pool + linear (position-invariant).
+        centroid:   spatial soft-argmax. A 1x1 conv produces a single-channel
+                    heatmap, softmax converts it to a spatial probability
+                    distribution, and the expected (x, y) coordinate is
+                    computed as a weighted sum against a fixed coordinate
+                    grid. A small Dense(2) affine layer stretches the output
+                    range to support off-frame centroids.
+    - With a 256x192 input this is ~20K params and ~20M MACs.
     """
+    input_height, input_width = input_shape[0], input_shape[1]
+    feat_h = input_height // 16  # 4 stride-2 layers: 2^4 = 16
+    feat_w = input_width // 16
+
     inputs = Input(shape=input_shape)
 
-    # Shared feature extractor: four stride-2 conv blocks.
+    # Shared feature extractor: four stride-2 conv blocks with BatchNorm.
     # H x W reductions for a 192 x 256 input: 96x128, 48x64, 24x32, 12x16.
-    x = Conv2D(16, 3, strides=2, padding='same', activation='relu')(inputs)
-    x = Conv2D(24, 3, strides=2, padding='same', activation='relu')(x)
-    x = Conv2D(32, 3, strides=2, padding='same', activation='relu')(x)
-    x = Conv2D(32, 3, strides=2, padding='same', activation='relu')(x)
+    x = Conv2D(16, 3, strides=2, padding='same', use_bias=False)(inputs)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+
+    x = Conv2D(24, 3, strides=2, padding='same', use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+
+    x = Conv2D(32, 3, strides=2, padding='same', use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+
+    x = Conv2D(32, 3, strides=2, padding='same', use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
 
     # Confidence head (position-invariant).
     conf = GlobalAveragePooling2D()(x)
     conf = Dense(1, activation='linear')(conf)
 
-    # Centroid head (position-sensitive). Channel-reduce to 8 so the flatten
-    # is cheap (12*16*8 = 1536 features at the default 256x192 input).
-    cen = Conv2D(8, 1, activation='relu')(x)
-    cen = Flatten()(cen)
-    cen = Dense(32, activation='relu')(cen)
-    cen = Dense(2, activation='linear')(cen)
+    # Centroid head: spatial soft-argmax.
+    # 1. Produce a single-channel heatmap from the feature map.
+    cen = Conv2D(1, 1, activation='linear')(x)          # (B, feat_h, feat_w, 1)
+    cen = Reshape((feat_h * feat_w,))(cen)              # (B, feat_h*feat_w)
+    cen = Activation('softmax')(cen)                     # spatial probability
+
+    # 2. Compute expected coordinates via dot product with a fixed grid.
+    #    Cell-centered coordinates in [0, 1].
+    gy = np.linspace(0.5 / feat_h, 1.0 - 0.5 / feat_h, feat_h)
+    gx = np.linspace(0.5 / feat_w, 1.0 - 0.5 / feat_w, feat_w)
+    grid_y, grid_x = np.meshgrid(gy, gx, indexing='ij')
+    gx_flat = grid_x.reshape(-1).astype(np.float32)     # (feat_h*feat_w,)
+    gy_flat = grid_y.reshape(-1).astype(np.float32)
+
+    def soft_argmax(probs):
+        cx = tf.reduce_sum(probs * tf.constant(gx_flat), axis=1, keepdims=True)
+        cy = tf.reduce_sum(probs * tf.constant(gy_flat), axis=1, keepdims=True)
+        return tf.concat([cx, cy], axis=1)
+
+    cen = Lambda(soft_argmax)(cen)                       # (B, 2)
+
+    # 3. Affine layer to allow unbounded output for off-frame suns.
+    #    Initialized as identity so it starts as pass-through.
+    cen = Dense(2, activation='linear',
+                kernel_initializer='identity',
+                bias_initializer='zeros')(cen)
 
     outputs = Concatenate()([conf, cen])
     return Model(inputs=inputs, outputs=outputs)
@@ -85,10 +121,11 @@ def custom_loss(y_true, y_pred):
     conf_pred = tf.sigmoid(conf_pred_logit)
     bce = tf.keras.losses.binary_crossentropy(conf_true, conf_pred)
 
+    LAMBDA_CENTROID = 5.0
     mse_cx = tf.square(cx_true - cx_pred) * has_sun
     mse_cy = tf.square(cy_true - cy_pred) * has_sun
 
-    return tf.reduce_mean(bce + mse_cx + mse_cy)
+    return tf.reduce_mean(bce + LAMBDA_CENTROID * (mse_cx + mse_cy))
 
 
 def load_dataset(data_dir, input_width, input_height):
@@ -132,7 +169,7 @@ def main():
                         help='Width to which images are resized before the CNN')
     parser.add_argument('--input_height', type=int, default=192,
                         help='Height to which images are resized before the CNN')
-    parser.add_argument('--epochs', type=int, default=20)
+    parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--validation_split', type=float, default=0.2)
     parser.add_argument('--output_model', type=str, default='sun_detector_model.keras',
@@ -151,7 +188,15 @@ def main():
 
     model = create_model((args.input_height, args.input_width, 1))
     model.summary()
-    model.compile(optimizer='adam', loss=custom_loss)
+
+    steps_per_epoch = len(X_train) // args.batch_size
+    lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
+        initial_learning_rate=1e-3,
+        decay_steps=args.epochs * steps_per_epoch,
+        alpha=1e-5)
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+
+    model.compile(optimizer=optimizer, loss=custom_loss)
     model.fit(X_train, y_train,
               validation_data=(X_test, y_test),
               epochs=args.epochs,
