@@ -9,12 +9,13 @@ from tensorflow.keras.models import Model
 from tensorflow.keras.layers import (Input, Conv2D, Dense,
                                       GlobalAveragePooling2D, Concatenate,
                                       Reshape, Activation, BatchNormalization,
-                                      Lambda)
+                                      Lambda, UpSampling2D)
 from sklearn.model_selection import train_test_split
 
 
 def create_model(input_shape):
-    """Compact CNN with spatial soft-argmax for sub-pixel centroid accuracy.
+    """Compact CNN with high-resolution spatial soft-argmax for sub-pixel
+    centroid accuracy.
 
     3 linear outputs: [confidence_logit, cx_norm, cy_norm]. Sigmoid is applied
     to the confidence channel in the loss (and at deployment). The two
@@ -28,17 +29,21 @@ def create_model(input_shape):
     - Feature depth grows as spatial dims shrink: 16 → 24 → 32 → 32.
     - Two output heads share the feature trunk:
         confidence: global average pool + linear (position-invariant).
-        centroid:   spatial soft-argmax. A 1x1 conv produces a single-channel
-                    heatmap, softmax converts it to a spatial probability
-                    distribution, and the expected (x, y) coordinate is
-                    computed as a weighted sum against a fixed coordinate
-                    grid. A small Dense(2) affine layer stretches the output
-                    range to support off-frame centroids.
-    - With a 256x192 input this is ~20K params and ~20M MACs.
+        centroid:   the centroid head branches from the 2nd conv block
+                    (48x64 grid, ~12.5px cells) for high spatial resolution.
+                    Deep features from the 4th block are upsampled and
+                    concatenated so the head has both fine spatial detail
+                    and semantic context. A 1x1 conv produces a heatmap,
+                    a learnable temperature sharpens the softmax peak,
+                    and the expected (x, y) coordinate is computed via
+                    dot product with a fixed coordinate grid. A Dense(2)
+                    affine layer stretches the output range for off-frame
+                    centroids.
+    - With a 256x192 input this is ~22K params and ~22M MACs.
     """
     input_height, input_width = input_shape[0], input_shape[1]
-    feat_h = input_height // 16  # 4 stride-2 layers: 2^4 = 16
-    feat_w = input_width // 16
+    cen_h = input_height // 4   # centroid head at 2nd block: stride 4
+    cen_w = input_width // 4
 
     inputs = Input(shape=input_shape)
 
@@ -51,6 +56,7 @@ def create_model(input_shape):
     x = Conv2D(24, 3, strides=2, padding='same', use_bias=False)(x)
     x = BatchNormalization()(x)
     x = Activation('relu')(x)
+    shallow = x  # (B, 48, 64, 24) — high-res features for centroid head
 
     x = Conv2D(32, 3, strides=2, padding='same', use_bias=False)(x)
     x = BatchNormalization()(x)
@@ -59,23 +65,40 @@ def create_model(input_shape):
     x = Conv2D(32, 3, strides=2, padding='same', use_bias=False)(x)
     x = BatchNormalization()(x)
     x = Activation('relu')(x)
+    deep = x  # (B, 12, 16, 32) — semantic features
 
-    # Confidence head (position-invariant).
-    conf = GlobalAveragePooling2D()(x)
+    # Confidence head (position-invariant) — uses full-depth features.
+    conf = GlobalAveragePooling2D()(deep)
     conf = Dense(1, activation='linear')(conf)
 
-    # Centroid head: spatial soft-argmax.
-    # 1. Produce a single-channel heatmap from the feature map.
-    cen = Conv2D(1, 1, activation='linear')(x)          # (B, feat_h, feat_w, 1)
-    cen = Reshape((feat_h * feat_w,))(cen)              # (B, feat_h*feat_w)
-    cen = Activation('softmax')(cen)                     # spatial probability
+    # Centroid head: multi-scale spatial soft-argmax.
+    # Upsample deep features to match shallow resolution, then concat.
+    deep_up = UpSampling2D(size=(4, 4), interpolation='bilinear')(deep)
+    fused = Concatenate()([shallow, deep_up])  # (B, 48, 64, 24+32=56)
 
-    # 2. Compute expected coordinates via dot product with a fixed grid.
+    # 1. Refinement conv to mix spatial + semantic info, then heatmap.
+    fused = Conv2D(32, 3, padding='same', use_bias=False)(fused)
+    fused = BatchNormalization()(fused)
+    fused = Activation('relu')(fused)
+    cen = Conv2D(1, 1, activation='linear')(fused)       # (B, cen_h, cen_w, 1)
+    cen = Reshape((cen_h * cen_w,))(cen)                 # (B, cen_h*cen_w)
+
+    # 2. Learnable temperature: sharper softmax → more precise peak.
+    #    Initialized to 1.0 (neutral); the model learns to decrease it.
+    log_temperature = tf.Variable(0.0, trainable=True, name='log_temperature')
+
+    def tempered_softmax(logits):
+        temperature = tf.exp(log_temperature)
+        return tf.nn.softmax(logits / temperature, axis=1)
+
+    cen = Lambda(tempered_softmax)(cen)                  # spatial probability
+
+    # 3. Compute expected coordinates via dot product with a fixed grid.
     #    Cell-centered coordinates in [0, 1].
-    gy = np.linspace(0.5 / feat_h, 1.0 - 0.5 / feat_h, feat_h)
-    gx = np.linspace(0.5 / feat_w, 1.0 - 0.5 / feat_w, feat_w)
+    gy = np.linspace(0.5 / cen_h, 1.0 - 0.5 / cen_h, cen_h)
+    gx = np.linspace(0.5 / cen_w, 1.0 - 0.5 / cen_w, cen_w)
     grid_y, grid_x = np.meshgrid(gy, gx, indexing='ij')
-    gx_flat = grid_x.reshape(-1).astype(np.float32)     # (feat_h*feat_w,)
+    gx_flat = grid_x.reshape(-1).astype(np.float32)      # (cen_h*cen_w,)
     gy_flat = grid_y.reshape(-1).astype(np.float32)
 
     def soft_argmax(probs):
@@ -83,9 +106,9 @@ def create_model(input_shape):
         cy = tf.reduce_sum(probs * tf.constant(gy_flat), axis=1, keepdims=True)
         return tf.concat([cx, cy], axis=1)
 
-    cen = Lambda(soft_argmax)(cen)                       # (B, 2)
+    cen = Lambda(soft_argmax)(cen)                        # (B, 2)
 
-    # 3. Affine layer to allow unbounded output for off-frame suns.
+    # 4. Affine layer to allow unbounded output for off-frame suns.
     #    Initialized as identity so it starts as pass-through.
     cen = Dense(2, activation='linear',
                 kernel_initializer='identity',
@@ -108,6 +131,10 @@ def custom_loss(y_true, y_pred):
     the occlusion factor for cloudy / partially occluded sun, 0.0 for no
     sun. Binary cross-entropy extends naturally to these soft targets and
     is better calibrated than MSE for probability-like outputs.
+
+    Centroid uses Huber (smooth L1) loss with delta=0.02 in normalized
+    coords (~16 px at 800 px width). This is more robust than MSE to
+    off-frame outliers while still penalizing small errors quadratically.
     """
     conf_true = y_true[:, 0]
     cx_true = y_true[:, 1]
@@ -121,11 +148,12 @@ def custom_loss(y_true, y_pred):
     conf_pred = tf.sigmoid(conf_pred_logit)
     bce = tf.keras.losses.binary_crossentropy(conf_true, conf_pred)
 
-    LAMBDA_CENTROID = 5.0
-    mse_cx = tf.square(cx_true - cx_pred) * has_sun
-    mse_cy = tf.square(cy_true - cy_pred) * has_sun
+    LAMBDA_CENTROID = 20.0
+    HUBER_DELTA = 0.1
+    huber_cx = tf.keras.losses.huber(cx_true, cx_pred, delta=HUBER_DELTA) * has_sun
+    huber_cy = tf.keras.losses.huber(cy_true, cy_pred, delta=HUBER_DELTA) * has_sun
 
-    return tf.reduce_mean(bce + LAMBDA_CENTROID * (mse_cx + mse_cy))
+    return tf.reduce_mean(bce + LAMBDA_CENTROID * (huber_cx + huber_cy))
 
 
 def load_dataset(data_dir, input_width, input_height):
