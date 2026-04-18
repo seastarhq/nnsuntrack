@@ -14,13 +14,11 @@ from sklearn.model_selection import train_test_split
 
 
 def create_model(input_shape):
-    """Compact CNN with high-resolution spatial soft-argmax for sub-pixel
+    """Compact CNN with coarse-to-fine spatial localization for sub-pixel
     centroid accuracy.
 
     3 linear outputs: [confidence_logit, cx_norm, cy_norm]. Sigmoid is applied
-    to the confidence channel in the loss (and at deployment). The two
-    centroid outputs are unbounded so they can represent a sun whose center
-    lies outside the image frame (normalized values < 0 or > 1).
+    to the confidence channel in the loss (and at deployment).
 
     Design notes:
     - Stride-2 convs with BatchNorm do the downsampling. BN stabilizes
@@ -29,17 +27,16 @@ def create_model(input_shape):
     - Feature depth grows as spatial dims shrink: 16 → 24 → 32 → 32.
     - Two output heads share the feature trunk:
         confidence: global average pool + linear (position-invariant).
-        centroid:   the centroid head branches from the 2nd conv block
-                    (48x64 grid, ~12.5px cells) for high spatial resolution.
-                    Deep features from the 4th block are upsampled and
-                    concatenated so the head has both fine spatial detail
-                    and semantic context. A 1x1 conv produces a heatmap,
-                    a learnable temperature sharpens the softmax peak,
-                    and the expected (x, y) coordinate is computed via
-                    dot product with a fixed coordinate grid. A Dense(2)
-                    affine layer stretches the output range for off-frame
-                    centroids.
-    - With a 256x192 input this is ~22K params and ~22M MACs.
+        centroid:   coarse-to-fine localization. The centroid head branches
+                    from the 2nd conv block (60x80 grid at 320x240 input,
+                    ~10px cells) for high spatial resolution. Deep features
+                    from the 4th block are upsampled and concatenated, then
+                    a 3x3 refinement conv fuses spatial + semantic info.
+                    A tempered soft-argmax produces a coarse position, then
+                    a context-aware offset MLP (GAP of fused features +
+                    coarse position → Dense(16) → Dense(2)) predicts a
+                    sub-grid-cell residual for fine adjustment.
+    - With a 320x240 input this is ~25K params and ~35M MACs.
     """
     input_height, input_width = input_shape[0], input_shape[1]
     cen_h = input_height // 4   # centroid head at 2nd block: stride 4
@@ -48,7 +45,7 @@ def create_model(input_shape):
     inputs = Input(shape=input_shape)
 
     # Shared feature extractor: four stride-2 conv blocks with BatchNorm.
-    # H x W reductions for a 192 x 256 input: 96x128, 48x64, 24x32, 12x16.
+    # H x W reductions for a 240 x 320 input: 120x160, 60x80, 30x40, 15x20.
     x = Conv2D(16, 3, strides=2, padding='same', use_bias=False)(inputs)
     x = BatchNormalization()(x)
     x = Activation('relu')(x)
@@ -108,11 +105,18 @@ def create_model(input_shape):
 
     cen = Lambda(soft_argmax)(cen)                        # (B, 2)
 
-    # 4. Affine layer to allow unbounded output for off-frame suns.
-    #    Initialized as identity so it starts as pass-through.
-    cen = Dense(2, activation='linear',
-                kernel_initializer='identity',
-                bias_initializer='zeros')(cen)
+    # 4. Coarse-to-fine offset refinement: the soft-argmax gives a coarse
+    #    position limited by grid resolution. A small MLP takes the coarse
+    #    (cx, cy) plus global context from the fused feature map and
+    #    predicts a sub-grid-cell (dx, dy) residual. Initialized to zero
+    #    so training starts from the coarse estimate.
+    cen_context = GlobalAveragePooling2D()(fused)          # (B, 32)
+    cen_input = Concatenate()([cen, cen_context])          # (B, 34)
+    offset = Dense(16, activation='relu')(cen_input)
+    offset = Dense(2, activation='linear',
+                   kernel_initializer='zeros',
+                   bias_initializer='zeros')(offset)       # (B, 2)
+    cen = Lambda(lambda args: args[0] + args[1])([cen, offset])
 
     outputs = Concatenate()([conf, cen])
     return Model(inputs=inputs, outputs=outputs)
@@ -132,9 +136,10 @@ def custom_loss(y_true, y_pred):
     sun. Binary cross-entropy extends naturally to these soft targets and
     is better calibrated than MSE for probability-like outputs.
 
-    Centroid uses Huber (smooth L1) loss with delta=0.02 in normalized
-    coords (~16 px at 800 px width). This is more robust than MSE to
-    off-frame outliers while still penalizing small errors quadratically.
+    Centroid uses Huber (smooth L1) loss with delta=0.1 in normalized
+    coords (~80 px at 800 px width). Errors within delta are penalized
+    quadratically; larger errors get linear gradients to limit the
+    influence of extreme outliers.
     """
     conf_true = y_true[:, 0]
     cx_true = y_true[:, 1]
@@ -162,15 +167,19 @@ def load_dataset(data_dir, input_width, input_height):
     Images are resized to (input_width, input_height) and normalized to
     [0, 1]. Centroid labels are normalized by the *original* image
     dimensions (inferred from the first image), so the model's centroid
-    outputs are invariant to the training input resolution. Off-frame
-    centroids produce normalized values outside [0, 1], which the
-    unbounded linear head can represent.
+    outputs are invariant to the training input resolution.
+
+    Off-frame suns (normalized centroid outside [0, 1]) have their
+    centroid targets clamped to the nearest frame edge. This teaches the
+    model to point toward the correct edge when the sun is just outside
+    the frame — the right behavior for the tracker's control loop.
     """
     df = pd.read_csv(os.path.join(data_dir, 'metadata.csv'))
     first = cv2.imread(os.path.join(data_dir, df.iloc[0]['image_filename']), 0)
     orig_height, orig_width = first.shape
 
     n = len(df)
+    n_clamped = 0
     X = np.zeros((n, input_height, input_width, 1), dtype=np.float32)
     y = np.zeros((n, 4), dtype=np.float32)
 
@@ -181,11 +190,16 @@ def load_dataset(data_dir, input_width, input_height):
 
         y[i, 0] = row['confidence']
         if pd.notna(row['centroid_x']):
-            y[i, 1] = row['centroid_x'] / orig_width
-            y[i, 2] = row['centroid_y'] / orig_height
+            cx_norm = row['centroid_x'] / orig_width
+            cy_norm = row['centroid_y'] / orig_height
+            if not (0.0 <= cx_norm <= 1.0 and 0.0 <= cy_norm <= 1.0):
+                n_clamped += 1
+            y[i, 1] = np.clip(cx_norm, 0.0, 1.0)
+            y[i, 2] = np.clip(cy_norm, 0.0, 1.0)
             y[i, 3] = 1.0
-        # else: leave centroid zeros and has_sun=0 to mask in the loss
 
+    print(f"Off-frame suns clamped to frame edge: {n_clamped}/{n} "
+          f"({100 * n_clamped / n:.1f}%)")
     return X, y, (orig_width, orig_height)
 
 
@@ -193,9 +207,9 @@ def main():
     parser = argparse.ArgumentParser(description="Train CNN for sun detection.")
     parser.add_argument('--data_dir', type=str, default='./synthetic_images',
                         help='Directory with synthetic images and metadata.csv')
-    parser.add_argument('--input_width', type=int, default=256,
+    parser.add_argument('--input_width', type=int, default=320,
                         help='Width to which images are resized before the CNN')
-    parser.add_argument('--input_height', type=int, default=192,
+    parser.add_argument('--input_height', type=int, default=240,
                         help='Height to which images are resized before the CNN')
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=32)
