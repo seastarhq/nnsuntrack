@@ -285,6 +285,54 @@ def main():
         (pred_cy[has_sun_mask] - true_cy[has_sun_mask])**2)
     report_centroid_accuracy(err_px_full[has_sun_mask], src_w)
 
+    # --- In-frame only centroid accuracy ---
+    in_frame_mask = (has_sun_mask
+                     & (true_cx >= 0) & (true_cx <= src_w)
+                     & (true_cy >= 0) & (true_cy <= src_h))
+    n_in = int(in_frame_mask.sum())
+    n_off = int(has_sun_mask.sum()) - n_in
+    print(f"\n=== In-frame centroid accuracy "
+          f"(n={n_in}, excluding {n_off} off-frame) ===")
+    if n_in > 0:
+        err_in = err_px_full[in_frame_mask]
+        print(f"  MAE:      {err_in.mean():7.2f} px")
+        print(f"  RMSE:     {np.sqrt((err_in**2).mean()):7.2f} px")
+        print(f"  median:   {np.median(err_in):7.2f} px")
+        print(f"  p95:      {np.percentile(err_in, 95):7.2f} px")
+        print(f"  max:      {err_in.max():7.2f} px")
+        print(f"  {'FOV':>8s}  {'MAE deg':>8s}  {'req. px':>8s}  "
+              f"{'within 0.1 deg':>15s}")
+        for fov in (30.0, 140.0):
+            deg_per_px = fov / src_w
+            req_px = 0.1 / deg_per_px
+            frac = float((err_in <= req_px).mean())
+            print(f"  {fov:7.0f}°  {err_in.mean() * deg_per_px:8.3f}  "
+                  f"{req_px:8.2f}  {100 * frac:14.1f}%")
+
+    # --- Clean-sun only accuracy (sun_only scenes, in-frame) ---
+    clean_mask = in_frame_mask & (scene_type == 'sun_only')
+    n_clean = int(clean_mask.sum())
+    print(f"\n=== Clean-sun only accuracy "
+          f"(sun_only + in-frame, n={n_clean}) ===")
+    if n_clean > 0:
+        err_clean = err_px_full[clean_mask]
+        conf_clean_mae = np.abs(true_conf[clean_mask]
+                                - pred_conf[clean_mask]).mean()
+        print(f"  conf MAE: {conf_clean_mae:7.4f}")
+        print(f"  MAE:      {err_clean.mean():7.2f} px")
+        print(f"  RMSE:     {np.sqrt((err_clean**2).mean()):7.2f} px")
+        print(f"  median:   {np.median(err_clean):7.2f} px")
+        print(f"  p95:      {np.percentile(err_clean, 95):7.2f} px")
+        print(f"  max:      {err_clean.max():7.2f} px")
+        print(f"  {'FOV':>8s}  {'MAE deg':>8s}  {'req. px':>8s}  "
+              f"{'within 0.1 deg':>15s}")
+        for fov in (30.0, 140.0):
+            deg_per_px = fov / src_w
+            req_px = 0.1 / deg_per_px
+            frac = float((err_clean <= req_px).mean())
+            print(f"  {fov:7.0f}°  {err_clean.mean() * deg_per_px:8.3f}  "
+                  f"{req_px:8.2f}  {100 * frac:14.1f}%")
+
     # --- Per-scene-type breakdown ---
     report_per_scene(scene_type, true_conf, pred_conf,
                      err_px_full, has_sun_mask)
