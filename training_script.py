@@ -239,11 +239,20 @@ def main():
     optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
 
     model.compile(optimizer=optimizer, loss=custom_loss)
+
+    best_weights = args.output_model.replace('.keras', '_best.weights.h5')
+    checkpoint = tf.keras.callbacks.ModelCheckpoint(
+        best_weights, monitor='val_loss', save_best_only=True,
+        save_weights_only=True, verbose=1)
+
     model.fit(X_train, y_train,
               validation_data=(X_test, y_test),
               epochs=args.epochs,
-              batch_size=args.batch_size)
+              batch_size=args.batch_size,
+              callbacks=[checkpoint])
 
+    # Reload the best weights for export (avoids Lambda deserialization issues).
+    model.load_weights(best_weights)
     model.save(args.output_model)
 
     # TFLite conversion: wrap the model in a concrete tf.function and convert

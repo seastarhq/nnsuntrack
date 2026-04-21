@@ -96,7 +96,9 @@ def apply_partial_occlusion(image, cx, cy, sun_radius, visible_fraction,
     cv2.fillPoly(image, [occluder], int(background_brightness))
 
 
-def generate_scene(image_width, image_height, min_size, max_size,
+def generate_scene(image_width, image_height,
+                   sun_min_size, sun_max_size,
+                   refl_min_size, refl_max_size,
                    min_ellipticity, max_ellipticity,
                    sun_brightness, background_brightness, noise_stddev):
     """Generate one synthetic scene and its label metadata.
@@ -135,7 +137,7 @@ def generate_scene(image_width, image_height, min_size, max_size,
         # centroid margin - the centroid is allowed to fall outside the frame
         # by up to one major axis, which covers "sun partially clipped by the
         # frame edge" through "sun just barely off-frame" cases.
-        sun_radius = random.uniform(min_size, max_size)
+        sun_radius = random.uniform(sun_min_size, sun_max_size)
         centroid_x = random.uniform(-sun_radius, image_width + sun_radius)
         centroid_y = random.uniform(-sun_radius, image_height + sun_radius)
 
@@ -177,7 +179,7 @@ def generate_scene(image_width, image_height, min_size, max_size,
             # or noticeably dimmer depending on the reflecting surface.
             refl_brightness = sun_brightness * random.uniform(0.5, 1.0)
             draw_reflection(image, image_width, image_height,
-                            min_size, max_size, refl_brightness)
+                            refl_min_size, refl_max_size, refl_brightness)
 
     # Gaussian noise. Use int16 intermediate to avoid uint8 wraparound on
     # negative samples.
@@ -202,10 +204,14 @@ def main():
                         help='Image width in pixels (default 800, matches Arducam)')
     parser.add_argument('--image_height', type=int, default=600,
                         help='Image height in pixels (default 600, matches Arducam)')
-    parser.add_argument('--min_size', type=float, default=20,
-                        help='Minimum size of objects (major-axis radius in pixels)')
-    parser.add_argument('--max_size', type=float, default=100,
-                        help='Maximum size of objects (major-axis radius in pixels)')
+    parser.add_argument('--sun_min_size', type=float, default=20,
+                        help='Minimum sun major-axis radius in pixels')
+    parser.add_argument('--sun_max_size', type=float, default=100,
+                        help='Maximum sun major-axis radius in pixels')
+    parser.add_argument('--refl_min_size', type=float, default=20,
+                        help='Minimum reflection size in pixels')
+    parser.add_argument('--refl_max_size', type=float, default=100,
+                        help='Maximum reflection size in pixels')
     parser.add_argument('--min_ellipticity', type=float, default=0.8,
                         help='Minimum ellipticity ratio (major/minor)')
     parser.add_argument('--max_ellipticity', type=float, default=1.2,
@@ -227,8 +233,10 @@ def main():
         image, metadata = generate_scene(
             image_width=args.image_width,
             image_height=args.image_height,
-            min_size=args.min_size,
-            max_size=args.max_size,
+            sun_min_size=args.sun_min_size,
+            sun_max_size=args.sun_max_size,
+            refl_min_size=args.refl_min_size,
+            refl_max_size=args.refl_max_size,
             min_ellipticity=args.min_ellipticity,
             max_ellipticity=args.max_ellipticity,
             sun_brightness=args.sun_brightness,
