@@ -7,4 +7,9 @@ lib64
 bin/
 synthetic_images/
 pyvenv.cfg
+.venv313/
+*.weights.h5
+logs/
+.smoke/
+__pycache__/
 

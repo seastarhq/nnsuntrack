@@ -24,7 +24,10 @@ import matplotlib.pyplot as plt
 try:
     import tflite_runtime.interpreter as tflite
 except ImportError:
-    from tensorflow import lite as tflite
+    try:
+        import ai_edge_litert.interpreter as tflite
+    except ImportError:
+        from tensorflow import lite as tflite
 
 
 def infer(interp, image, input_details, output_details,

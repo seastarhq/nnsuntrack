@@ -23,13 +23,17 @@ import cv2
 import argparse
 
 # Prefer the lightweight tflite_runtime package on the RPi5; fall back to
-# the Interpreter shipped inside full TensorFlow when running on a
-# workstation for local validation. The two APIs are identical for the
-# methods we use.
+# ai_edge_litert (its renamed continuation, and the only one of the two
+# with wheels for recent Pythons), then to the Interpreter shipped inside
+# full TensorFlow when running on a workstation for local validation. All
+# three APIs are identical for the methods we use.
 try:
     import tflite_runtime.interpreter as tflite
 except ImportError:
-    from tensorflow import lite as tflite
+    try:
+        import ai_edge_litert.interpreter as tflite
+    except ImportError:
+        from tensorflow import lite as tflite
 
 
 def load_model(model_path, num_threads=4):
