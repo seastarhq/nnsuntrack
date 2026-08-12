@@ -23,8 +23,13 @@ SHELL := /bin/bash
 PY       ?= .venv/bin/python
 TRAIN_PY ?= .venv313/bin/python
 
-DATA_DIR   ?= synthetic_images
-NUM_IMAGES ?= 20000
+# One dataset and one model per camera: the narrow lens does 0.1-degree
+# tracking, the fisheye does sky orientation. CAMERA=fisheye also moves
+# DATA_DIR and MODEL, so the two never overwrite each other.
+CAMERA     ?= narrow
+
+DATA_DIR   ?= synthetic_images_$(CAMERA)
+NUM_IMAGES ?= 40000
 DATA_ARGS  ?=
 
 # TF 2.21's RPATH misses the pip-installed libcusolver.so.11, so it drops to
@@ -37,7 +42,7 @@ NVIDIA_LIB_PATH = $(shell $(TRAIN_PY) -c "import glob, os, nvidia; \
 # To force CPU training instead: make train TRAIN_ENV=CUDA_VISIBLE_DEVICES=-1
 TRAIN_ENV ?= LD_LIBRARY_PATH="$(NVIDIA_LIB_PATH):$$LD_LIBRARY_PATH"
 
-MODEL             ?= sun_detector_model
+MODEL             ?= sun_detector_model_$(CAMERA)
 EPOCHS            ?= 50
 BATCH_SIZE        ?= 32
 VALIDATION_SPLIT  ?= 0.2
@@ -86,6 +91,7 @@ data: $(METADATA)
 $(METADATA): synthetic_data_script.py | $(LOG_DIR)
 	$(PY) synthetic_data_script.py \
 	    --num_images $(NUM_IMAGES) \
+	    --camera $(CAMERA) \
 	    --output_dir $(DATA_DIR) \
 	    $(DATA_ARGS) 2>&1 | tee $(LOG_DIR)/data.log
 
@@ -133,8 +139,8 @@ infer: $(TFLITE)
 ## smoke: 400 images / 5 epochs end-to-end, contained in .smoke/
 smoke:
 	$(MAKE) --no-print-directory \
-	    DATA_DIR=$(SMOKE_DIR)/synthetic_images \
-	    MODEL=$(SMOKE_DIR)/sun_detector_model \
+	    DATA_DIR=$(SMOKE_DIR)/synthetic_images_$(CAMERA) \
+	    MODEL=$(SMOKE_DIR)/sun_detector_model_$(CAMERA) \
 	    LOG_DIR=$(SMOKE_DIR)/logs \
 	    NUM_IMAGES=400 EPOCHS=5 \
 	    infer

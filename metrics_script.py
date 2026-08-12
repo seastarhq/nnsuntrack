@@ -53,9 +53,9 @@ except ImportError:
 
 def infer_raw(interp, image, input_details, output_details,
               input_width, input_height):
-    """One inference. Returns raw (conf_logit, cx_norm, cy_norm).
+    """One inference. Returns raw (conf_logit, cx_norm, cy_norm, presence_logit).
 
-    Bypasses deployment_script.run_inference so the NaN-on-low-confidence
+    Bypasses deployment_script.run_inference so the NaN-on-low-presence
     gate doesn't hide prediction error on below-threshold frames - we
     want every prediction for the metrics pass.
     """
@@ -65,7 +65,7 @@ def infer_raw(interp, image, input_details, output_details,
     interp.set_tensor(input_details['index'], x)
     interp.invoke()
     out = interp.get_tensor(output_details['index'])[0]
-    return float(out[0]), float(out[1]), float(out[2])
+    return float(out[0]), float(out[1]), float(out[2]), float(out[3])
 
 
 def benchmark_latency(interp, sample_images, warmup, iters):
@@ -108,16 +108,15 @@ def report_latency(times_ms, budget_ms):
     print(f"  steady-state throughput: {1000.0 / times_ms.mean():.1f} Hz")
 
 
-def report_detection(true_conf, pred_conf, primary_threshold):
+def report_detection(true_present, pred_presence, primary_threshold):
     """Binary precision / recall / F1 at several candidate thresholds."""
-    # Sun present (clear or occluded) vs not present.
-    positive = true_conf > 0
+    positive = true_present
 
     print("\n=== Binary detection (sun present vs absent) ===")
     print(f"  {'threshold':>10s}  {'TP':>5s} {'FP':>5s} {'FN':>5s} {'TN':>5s}  "
           f"{'precision':>9s} {'recall':>7s} {'F1':>6s}")
     for thr in [0.1, 0.3, primary_threshold, 0.7, 0.9]:
-        det = pred_conf >= thr
+        det = pred_presence >= thr
         tp = int((positive & det).sum())
         fp = int((~positive & det).sum())
         fn = int((positive & ~det).sum())
@@ -128,7 +127,7 @@ def report_detection(true_conf, pred_conf, primary_threshold):
         marker = "  *" if thr == primary_threshold else "   "
         print(f"{marker}{thr:8.2f}   {tp:5d} {fp:5d} {fn:5d} {tn:5d}  "
               f"{prec:9.3f} {rec:7.3f} {f1:6.3f}")
-    print("  * = deployment threshold (see --confidence_threshold)")
+    print("  * = deployment threshold (see --presence_threshold)")
 
 
 def report_confidence_calibration(true_conf, pred_conf):
@@ -209,8 +208,12 @@ def main():
                    default='sun_detector_model.tflite',
                    help='Path to the TFLite model to evaluate')
     p.add_argument('--confidence_threshold', type=float, default=0.5,
-                   help='Primary threshold for detection metrics '
+                   help='Threshold marking a fix as degraded/occluded '
                         '(should match deployment_script)')
+    p.add_argument('--presence_threshold', type=float, default=0.5,
+                   help='Primary threshold for detection metrics; gates the '
+                        'centroid at deployment (should match '
+                        'deployment_script)')
     p.add_argument('--budget_ms', type=float, default=20.0,
                    help='Per-frame latency budget (50 Hz = 20 ms)')
     p.add_argument('--num_threads', type=int, default=4,
@@ -259,23 +262,33 @@ def main():
     pred_conf = np.zeros(n, dtype=np.float32)
     pred_cx = np.zeros(n, dtype=np.float32)
     pred_cy = np.zeros(n, dtype=np.float32)
+    pred_presence = np.zeros(n, dtype=np.float32)
 
     for i, fn in enumerate(df['image_filename']):
         img = cv2.imread(os.path.join(args.data_dir, fn), 0)
-        logit, cxn, cyn = infer_raw(interp, img, input_details,
-                                     output_details, in_w, in_h)
+        logit, cxn, cyn, presence_logit = infer_raw(
+            interp, img, input_details, output_details, in_w, in_h)
         # Numerically stable sigmoid.
         pred_conf[i] = 1.0 / (1.0 + np.exp(-logit))
         pred_cx[i] = cxn * src_w
         pred_cy[i] = cyn * src_h
+        pred_presence[i] = 1.0 / (1.0 + np.exp(-presence_logit))
 
     true_conf = df['confidence'].to_numpy(dtype=np.float32)
     true_cx = df['centroid_x'].to_numpy(dtype=np.float32)
     true_cy = df['centroid_y'].to_numpy(dtype=np.float32)
     scene_type = df['scene_type'].to_numpy()
+    # Fall back for datasets generated before the sun_present column.
+    if 'sun_present' in df.columns:
+        true_present = df['sun_present'].to_numpy(dtype=np.float32) > 0.5
+    else:
+        true_present = ~np.isnan(true_cx)
 
     # --- Detection ---
-    report_detection(true_conf, pred_conf, args.confidence_threshold)
+    # Scored on the presence output, not confidence: a fully occluded sun
+    # has confidence near 0 but is still present, and thresholding
+    # confidence would count it as a miss.
+    report_detection(true_present, pred_presence, args.presence_threshold)
 
     # --- Confidence calibration ---
     report_confidence_calibration(true_conf, pred_conf)

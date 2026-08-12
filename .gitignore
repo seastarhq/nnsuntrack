@@ -6,6 +6,7 @@ lib/
 lib64
 bin/
 synthetic_images/
+synthetic_images_narrow/
 pyvenv.cfg
 .venv313/
 *.weights.h5

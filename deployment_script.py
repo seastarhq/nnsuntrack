@@ -8,15 +8,26 @@ publishes the result to the sun-position topic that the control loop
 consumes.
 
 Output semantics match the training labels:
-  confidence: continuous in [0, 1]. 1.0 for a clear sun, lower when the
-              sun is occluded (thin cloud, partial blockage), 0.0 when no
-              sun is in the frame.
-  cx, cy:     pixel coordinates of the sun center in the *source* image.
-              May fall outside the image bounds when the sun is partially
-              off-frame. Returned as NaN when confidence is below the
-              configured threshold - the downstream ROS2 node treats NaN
-              as "no fix" and falls back to the ephemeris-predicted
-              position.
+  confidence:  continuous in [0, 1]. 1.0 for a clear sun, the fraction of
+               light getting through when it is occluded (thin cloud,
+               partial blockage, bright cloud edge).
+  sun_present: continuous in [0, 1]. Whether a sun is in the frame at all,
+               independent of how much of it is visible.
+  cx, cy:      pixel coordinates of the sun center in the *source* image.
+               May fall outside the image bounds when the sun is partially
+               off-frame. Returned as NaN when *presence* is below the
+               configured threshold - the downstream ROS2 node treats NaN
+               as "no fix" and falls back to the ephemeris-predicted
+               position.
+
+The two scores separate "there is no sun here" from "the sun is here but
+obscured". A sun behind a bright cloud edge reads presence high,
+confidence low, and keeps a usable centroid - so the tracker holds its
+lock instead of dropping to ephemeris at the moment the sky gets
+interesting.
+
+NOTE: run_inference returns 4 values as of the presence output; callers
+written against the previous 3-tuple need updating.
 """
 import numpy as np
 import cv2
@@ -43,18 +54,27 @@ def load_model(model_path, num_threads=4):
     return interp
 
 
-def run_inference(interp, image, confidence_threshold):
+def run_inference(interp, image, confidence_threshold, presence_threshold=0.5):
     """Run one forward pass.
 
     Args:
         interp: TFLite interpreter returned by `load_model`.
         image:  grayscale uint8 numpy array of any size. It is resized to
                 the model's input shape on the fly.
-        confidence_threshold: sigmoid-space cutoff. Below this the
-                centroid is replaced with NaN.
+        confidence_threshold: sigmoid-space cutoff on confidence. Reported
+                but no longer used to gate the centroid - see below.
+        presence_threshold: sigmoid-space cutoff on presence. Below this
+                the centroid is replaced with NaN.
 
-    Returns (confidence, cx, cy). cx, cy are pixel coordinates in the
-    source image frame (not the resized model input).
+    Returns (confidence, cx, cy, sun_present). cx, cy are pixel coordinates
+    in the source image frame (not the resized model input).
+
+    The centroid is gated on *presence*, not confidence. A sun behind a
+    bright cloud edge has low confidence but is still there and still
+    locatable, and the tracker should keep following it; gating on
+    confidence would throw that position away exactly when the ephemeris
+    fallback is least necessary. Use confidence to weight how much to
+    trust the fix, and presence to decide whether there is one at all.
     """
     source_height, source_width = image.shape
 
@@ -73,14 +93,15 @@ def run_inference(interp, image, confidence_threshold):
 
     interp.set_tensor(input_details['index'], x)
     interp.invoke()
-    output = interp.get_tensor(output_details['index'])[0]  # shape (3,)
+    output = interp.get_tensor(output_details['index'])[0]  # shape (4,)
 
-    conf_logit, cx_norm, cy_norm = output
-    # The model emits a raw logit for confidence; apply sigmoid here (the
-    # training loss applies it internally for numerical stability).
+    conf_logit, cx_norm, cy_norm, presence_logit = output
+    # The model emits raw logits; apply sigmoid here (the training loss
+    # applies it internally for numerical stability).
     confidence = float(1.0 / (1.0 + np.exp(-conf_logit)))
+    sun_present = float(1.0 / (1.0 + np.exp(-presence_logit)))
 
-    if confidence >= confidence_threshold:
+    if sun_present >= presence_threshold:
         # Centroid is trained as a fractional position in the source image,
         # so we un-normalize by the source dimensions. Values < 0 or > the
         # frame size indicate a sun whose center is off-frame.
@@ -90,7 +111,7 @@ def run_inference(interp, image, confidence_threshold):
         cx = float('nan')
         cy = float('nan')
 
-    return confidence, cx, cy
+    return confidence, cx, cy, sun_present
 
 
 def main():
@@ -102,7 +123,10 @@ def main():
     parser.add_argument('--model_path', type=str, default='sun_detector_model.tflite',
                         help='Path to TFLite model')
     parser.add_argument('--confidence_threshold', type=float, default=0.5,
-                        help='Minimum confidence to report a centroid. Below this, '
+                        help='Confidence below this marks the fix as degraded '
+                             '(sun occluded); the centroid is still reported.')
+    parser.add_argument('--presence_threshold', type=float, default=0.5,
+                        help='Minimum presence to report a centroid. Below this, '
                              'centroid is NaN and the ROS2 control node should use '
                              'the ephemeris-predicted position instead.')
     parser.add_argument('--num_threads', type=int, default=4,
@@ -115,12 +139,16 @@ def main():
         raise FileNotFoundError(f"Could not read image: {args.image_path}")
 
     interp = load_model(args.model_path, num_threads=args.num_threads)
-    confidence, cx, cy = run_inference(interp, image, args.confidence_threshold)
+    confidence, cx, cy, sun_present = run_inference(
+        interp, image, args.confidence_threshold, args.presence_threshold)
 
     if np.isnan(cx):
-        print(f"confidence={confidence:.3f} (below threshold); no sun detection")
+        print(f"presence={sun_present:.3f} (below threshold); no sun detection")
     else:
-        print(f"confidence={confidence:.3f} centroid=({cx:.2f}, {cy:.2f}) pixels")
+        state = ('occluded' if confidence < args.confidence_threshold
+                 else 'clear')
+        print(f"presence={sun_present:.3f} confidence={confidence:.3f} "
+              f"({state}) centroid=({cx:.2f}, {cy:.2f}) pixels")
 
 
 if __name__ == "__main__":

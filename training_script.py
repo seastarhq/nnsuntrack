@@ -17,8 +17,17 @@ def create_model(input_shape):
     """Compact CNN with coarse-to-fine spatial localization for sub-pixel
     centroid accuracy.
 
-    3 linear outputs: [confidence_logit, cx_norm, cy_norm]. Sigmoid is applied
-    to the confidence channel in the loss (and at deployment).
+    4 linear outputs: [confidence_logit, cx_norm, cy_norm, presence_logit].
+    Sigmoid is applied to the confidence and presence channels in the loss
+    (and at deployment).
+
+    Confidence and presence answer different questions, which is why both
+    exist. Confidence is how much of the sun is getting through (1.0 clear,
+    the transmission fraction when a cloud is over it). Presence is simply
+    whether a sun is in the frame at all. A sun fully hidden behind a thick
+    cloud edge has confidence near 0 but presence 1 - and its position is
+    still known, so the tracker should keep following it rather than
+    dropping to ephemeris.
 
     Design notes:
     - Stride-2 convs with BatchNorm do the downsampling. BN stabilizes
@@ -64,9 +73,11 @@ def create_model(input_shape):
     x = Activation('relu')(x)
     deep = x  # (B, 12, 16, 32) — semantic features
 
-    # Confidence head (position-invariant) — uses full-depth features.
-    conf = GlobalAveragePooling2D()(deep)
-    conf = Dense(1, activation='linear')(conf)
+    # Confidence and presence heads (both position-invariant) share one
+    # pooling of the full-depth features.
+    pooled = GlobalAveragePooling2D()(deep)
+    conf = Dense(1, activation='linear')(pooled)
+    presence = Dense(1, activation='linear')(pooled)
 
     # Centroid head: multi-scale spatial soft-argmax.
     # Upsample deep features to match shallow resolution, then concat.
@@ -118,18 +129,21 @@ def create_model(input_shape):
                    bias_initializer='zeros')(offset)       # (B, 2)
     cen = Lambda(lambda args: args[0] + args[1])([cen, offset])
 
-    outputs = Concatenate()([conf, cen])
+    outputs = Concatenate()([conf, cen, presence])
     return Model(inputs=inputs, outputs=outputs)
 
 
 def custom_loss(y_true, y_pred):
     """Continuous-confidence + centroid regression loss.
 
-    y_true has 4 values per sample: [confidence, cx_norm, cy_norm, has_sun].
-    The 4th channel is a mask: 1.0 when a sun is present in the scene
-    (confidence > 0) and 0.0 otherwise. It gates the centroid loss so that
-    no-sun scenes (which carry placeholder centroid zeros, not real labels)
-    do not pull the centroid head toward (0, 0).
+    y_true has 4 values per sample: [confidence, cx_norm, cy_norm, sun_present].
+
+    The 4th channel does double duty. It gates the centroid loss, so no-sun
+    scenes (which carry placeholder centroid zeros, not real labels) do not
+    pull the centroid head toward (0, 0) - and it is the target for the
+    presence output. Those are the same quantity: a sun is present exactly
+    when the scene has a real centroid to regress toward, including when
+    the sun is fully occluded.
 
     The confidence target is continuous in [0, 1] - 1.0 for a clear sun,
     the occlusion factor for cloudy / partially occluded sun, 0.0 for no
@@ -146,28 +160,38 @@ def custom_loss(y_true, y_pred):
     cy_true = y_true[:, 2]
     has_sun = y_true[:, 3]
 
-    conf_pred_logit = y_pred[:, 0]
     cx_pred = y_pred[:, 1]
     cy_pred = y_pred[:, 2]
 
-    conf_pred = tf.sigmoid(conf_pred_logit)
+    conf_pred = tf.sigmoid(y_pred[:, 0])
     bce = tf.keras.losses.binary_crossentropy(conf_true, conf_pred)
 
+    presence_pred = tf.sigmoid(y_pred[:, 3])
+    bce_presence = tf.keras.losses.binary_crossentropy(has_sun, presence_pred)
+
     LAMBDA_CENTROID = 20.0
+    LAMBDA_PRESENCE = 1.0
     HUBER_DELTA = 0.1
     huber_cx = tf.keras.losses.huber(cx_true, cx_pred, delta=HUBER_DELTA) * has_sun
     huber_cy = tf.keras.losses.huber(cy_true, cy_pred, delta=HUBER_DELTA) * has_sun
 
-    return tf.reduce_mean(bce + LAMBDA_CENTROID * (huber_cx + huber_cy))
+    return tf.reduce_mean(bce + LAMBDA_PRESENCE * bce_presence
+                          + LAMBDA_CENTROID * (huber_cx + huber_cy))
 
 
-def load_dataset(data_dir, input_width, input_height):
+def load_dataset(data_dir, input_width, input_height, normalize=False):
     """Load images + labels from `data_dir` (expects metadata.csv and PNGs).
 
-    Images are resized to (input_width, input_height) and normalized to
-    [0, 1]. Centroid labels are normalized by the *original* image
-    dimensions (inferred from the first image), so the model's centroid
-    outputs are invariant to the training input resolution.
+    Images are resized to (input_width, input_height). With `normalize`
+    they come back as float32 in [0, 1], ready to hand straight to
+    `model.fit`; otherwise they stay uint8 and `make_dataset` does the
+    scaling one batch at a time. A 20K-image set is 1.5 GB as uint8
+    versus 6.1 GB as float32, and the whole set is held in host RAM at
+    once, so the uint8 form is the default.
+
+    Centroid labels are normalized by the *original* image dimensions
+    (inferred from the first image), so the model's centroid outputs are
+    invariant to the training input resolution.
 
     Off-frame suns (normalized centroid outside [0, 1]) have their
     centroid targets clamped to the nearest frame edge. This teaches the
@@ -180,13 +204,15 @@ def load_dataset(data_dir, input_width, input_height):
 
     n = len(df)
     n_clamped = 0
-    X = np.zeros((n, input_height, input_width, 1), dtype=np.float32)
+    has_presence = 'sun_present' in df.columns
+    X = np.zeros((n, input_height, input_width, 1),
+                 dtype=np.float32 if normalize else np.uint8)
     y = np.zeros((n, 4), dtype=np.float32)
 
     for i, row in df.iterrows():
         img = cv2.imread(os.path.join(data_dir, row['image_filename']), 0)
         img = cv2.resize(img, (input_width, input_height))
-        X[i, :, :, 0] = img.astype(np.float32) / 255.0
+        X[i, :, :, 0] = img.astype(np.float32) / 255.0 if normalize else img
 
         y[i, 0] = row['confidence']
         if pd.notna(row['centroid_x']):
@@ -196,7 +222,10 @@ def load_dataset(data_dir, input_width, input_height):
                 n_clamped += 1
             y[i, 1] = np.clip(cx_norm, 0.0, 1.0)
             y[i, 2] = np.clip(cy_norm, 0.0, 1.0)
-            y[i, 3] = 1.0
+            # sun_present, when the generator recorded it. Datasets made
+            # before that column existed fall back to "has a centroid",
+            # which is the same thing.
+            y[i, 3] = row['sun_present'] if has_presence else 1.0
 
     print(f"Off-frame suns clamped to frame edge: {n_clamped}/{n} "
           f"({100 * n_clamped / n:.1f}%)")

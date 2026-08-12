@@ -1,0 +1,195 @@
+Synthetic Image Generation - Realism Rewrite
+2026-08-11
+=======================================================================
+
+Rewrite of synthetic_data_script.py for physical realism, plus the
+Makefile changes that go with it.
+
+
+-----------------------------------------------------------
+Core change
+-----------------------------------------------------------
+
+Scenes are now built in linear radiance (float32) and pushed through the
+imaging chain in the order light actually meets it:
+
+    scene radiance -> optics (bloom, flare, vignetting)
+                   -> exposure/gain
+                   -> sensor (PRNU, hot pixels/rows, shot + read noise)
+                   -> 8-bit quantization
+
+Previously everything was drawn directly in 8-bit. That is what makes
+the bright cases behave: the sun is ~1e4 times brighter than the sky, so
+it saturates and its point-spread wings bloom into a blob far larger
+than the disk itself. A flat-topped disk drawn at brightness 200 cannot
+reproduce that.
+
+
+-----------------------------------------------------------
+Sun size - now geometric, not arbitrary
+-----------------------------------------------------------
+
+Driven by --sun_angular_diameter (0.53 deg default) through a camera
+model rather than a free pixel range:
+
+    narrow  (30 deg, rectilinear)   13.8 px across
+    fisheye (140 deg, equidistant)   3.0 px across
+
+Both verified against hand arithmetic. The old 20-100 px *radius* range
+was 3-30x oversized.
+
+Still fully overridable for a hardware change:
+    --fov_deg  --projection  --image_width/height
+    --sun_radius_px      force a fixed pixel radius
+    --sun_size_scale     multiplier on angular diameter
+
+Off-axis anisotropy falls out of the projection correctly, and in
+opposite directions for the two lenses (semi-axis ratio at frame edge):
+
+    rectilinear  0.957   sun stretched radially
+    equidistant  1.401   sun stretched tangentially
+
+
+-----------------------------------------------------------
+Bright cloud edges
+-----------------------------------------------------------
+
+Forward-scattered sunlight through a thin cloud edge is modelled as
+peaking at moderate optical depth (thick cloud blocks it, clear sky has
+nothing to scatter) and falling off with distance from the sun. The edge
+genuinely outshines the solar disk, so "track the brightest blob" is the
+wrong policy - while the label keeps pointing at the sun.
+
+Occlusion is computed from mean transmission over the solar disk, giving
+a continuous label rather than a binary flag.
+
+Measured effect - brightest-blob tracker centroid error:
+
+    sun_only            median   0.7 px
+    bright_cloud_edge   median  56.9 px,  50% of frames off by >20 px
+    occluded_sun        median   0.6 px
+
+Relevant knobs:
+    --forward_scatter_gain   brightness of the edge glow
+    --forward_scatter_scale  falloff distance in px
+    --cloud_optical_depth  --cloud_edge_softness
+    --cloud_thickness_scale  --cloud_shade_range
+
+
+-----------------------------------------------------------
+Realism items added
+-----------------------------------------------------------
+
+  - Multi-scale PSF bloom (sharp core + broad veiling-glare wings).
+    One PSF for everything: bloom is a property of the lens, so the same
+    convolution applies to the sun and to glints. The sun blooms more
+    only because it is brighter.
+  - Lens flare ghosts along the sun-to-optical-centre axis.
+  - Hot pixels and hot rows, fixed-pattern: generated once per dataset
+    from --seed so they sit at the same pixels in every frame.
+    Re-rolling them per image would make them ordinary noise.
+  - PRNU (per-pixel gain variation), dark offset.
+  - Poisson shot noise scaling with signal, plus Gaussian read noise.
+    Replaces the old uniform additive Gaussian.
+  - cos^4 vignetting (gentler falloff for the fisheye).
+  - Sky brightness gradient; cloud fBm noise with backlit shading, so
+    thin parts glow and thick cores go dark.
+  - Fixed and auto-exposure regimes, mixed by default (--exposure).
+
+Starburst / diffraction spikes are OFF by default (--starburst to
+enable). The Arducam has a fixed aperture and no diaphragm blades, so it
+cannot produce them - that was a DSLR artifact and was removed.
+
+
+-----------------------------------------------------------
+New label columns in metadata.csv
+-----------------------------------------------------------
+
+    sun_present     1.0 whenever a sun is in the scene, even fully
+                    hidden - separates "no sun here" from "sun present
+                    but occluded"
+    occlusion       0.0 clear .. 1.0 fully hidden, NaN when no sun
+    exposure_mode   'auto' or 'fixed'
+    exposure_gain   gain applied to that frame
+
+confidence keeps its previous meaning (1.0 clear, mean transmission when
+occluded, 0.0 when no sun). Centroids stay labelled through occlusion,
+including when the sun is fully hidden, so tracking continues.
+
+Columns are additive, so training_script.py loads the data unchanged.
+A generation_params.json is also written to each dataset directory,
+recording camera geometry - otherwise unrecoverable from the PNGs.
+
+
+-----------------------------------------------------------
+Three defects found by inspecting the output
+-----------------------------------------------------------
+
+Each would have quietly degraded the dataset:
+
+  1. Auto-exposure metered on the 99th percentile, so a single
+     saturating glint drove gain to its floor and crushed the whole sky
+     to black. Now center-weighted average metering.
+  2. Reflections at 20-100 px were enormous and hard-edged - cartoon
+     polygons. Now 5-45 px and sharing the lens PSF.
+  3. Clouds were flat binary blobs. Now soft-edged with backlit shading.
+
+Also: fixed-exposure gain was sampled over a 10x range, producing frames
+57% saturated to white that were still labelled confidence=1.0 with a
+centroid - actively harmful training data. Fixed exposure now samples a
+narrow range (a real fixed exposure is set for the sky); auto-exposure
+keeps the wide range as clip limits. No frame in 120 now exceeds 20%
+saturation.
+
+
+-----------------------------------------------------------
+Makefile
+-----------------------------------------------------------
+
+CAMERA ?= narrow now drives --camera and moves DATA_DIR and MODEL to
+*_$(CAMERA), so the two cameras never overwrite each other:
+
+    make train CAMERA=fisheye
+
+One dataset and one model per camera: the narrow lens does 0.1-degree
+tracking, the fisheye does sky orientation.
+
+
+-----------------------------------------------------------
+Cost
+-----------------------------------------------------------
+
+~62 ms/image, so a 70000-image dataset takes ~72 minutes - up from ~2
+minutes, and now comparable to training time. That is the price of the
+radiance pipeline. The per-image work is embarrassingly parallel; a
+multiprocessing.Pool would cut it to a few minutes.
+
+
+-----------------------------------------------------------
+Verified
+-----------------------------------------------------------
+
+  - Both camera presets generate; disk sizes match hand calculation.
+  - Off-axis anisotropy correct and opposite for the two projections.
+  - Label distributions sane across all seven scene types.
+  - Bright-cloud effect defeats brightest-blob tracking as intended.
+  - Visual inspection of contact sheets at each iteration.
+  - Full `make smoke` end-to-end on GPU: data -> train -> tflite ->
+    inference, output confidence=0.517 centroid=(360.41, 276.91).
+
+
+-----------------------------------------------------------
+Outstanding
+-----------------------------------------------------------
+
+1. The occlusion / sun_present labels are inert. training_script.py
+   outputs 3 values and its y is 4-wide (4th is a loss mask). Consuming
+   the new signal means a 5-wide label, a new head, a loss change, and
+   matching updates in metrics/visualize/deployment. That last one
+   changes run_inference's return signature, which the ROS2 node
+   imports.
+
+2. Clouds and glints are drawn in image space without a projection warp,
+   so the fisheye's radial stretching is not imprinted on them.
+   Defensible since both are procedurally random, but it is a real
+   limitation.

@@ -32,7 +32,10 @@ except ImportError:
 
 def infer(interp, image, input_details, output_details,
           input_width, input_height):
-    """Run one inference. Returns (confidence, cx_px, cy_px) in source pixels."""
+    """Run one inference.
+
+    Returns (confidence, cx_px, cy_px, sun_present) in source pixels.
+    """
     resized = cv2.resize(image, (input_width, input_height))
     x = resized.astype(np.float32) / 255.0
     x = x[np.newaxis, :, :, np.newaxis]
@@ -41,8 +44,9 @@ def infer(interp, image, input_details, output_details,
     out = interp.get_tensor(output_details['index'])[0]
     logit, cxn, cyn = float(out[0]), float(out[1]), float(out[2])
     confidence = 1.0 / (1.0 + np.exp(-logit))
+    sun_present = 1.0 / (1.0 + np.exp(-float(out[3])))
     h, w = image.shape
-    return confidence, cxn * w, cyn * h
+    return confidence, cxn * w, cyn * h, sun_present
 
 
 def draw_crosshair(rgb, cx, cy, color, gap=6, arm=18, thickness=2):
@@ -94,6 +98,9 @@ def main():
     p.add_argument('--seed', type=int, default=0,
                    help='Random seed when --random is set')
     p.add_argument('--confidence_threshold', type=float, default=0.5,
+                   help='Below this the fix is labelled occluded (the '
+                        'crosshair is still drawn)')
+    p.add_argument('--presence_threshold', type=float, default=0.5,
                    help='Below this, the crosshair is dimmed grey to show '
                         'the deployment NaN-centroid behavior')
     p.add_argument('--show_truth', action='store_true',
@@ -152,9 +159,11 @@ def main():
             os.path.join(args.data_dir, rec['image_filename']), 0)
         rgb = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
 
-        confidence, pred_cx, pred_cy = infer(
+        confidence, pred_cx, pred_cy, sun_present = infer(
             interp, img_gray, in_d, out_d, in_w, in_h)
-        detected = confidence >= args.confidence_threshold
+        # Presence decides whether there is a fix at all; confidence only
+        # says how obscured it is. An occluded sun still gets a crosshair.
+        detected = sun_present >= args.presence_threshold
         color = PRED_COLOR if detected else DIM_COLOR
 
         draw_crosshair(rgb, pred_cx, pred_cy, color)
@@ -165,10 +174,15 @@ def main():
                            TRUTH_COLOR)
 
         ax.imshow(rgb)
-        status = '' if detected else ' [<thr]'
+        if not detected:
+            status = ' [no sun]'
+        elif confidence < args.confidence_threshold:
+            status = ' [occluded]'
+        else:
+            status = ''
         ax.set_title(
-            f"#{idx}  conf={confidence:.2f}{status}\n{rec['scene_type']}",
-            fontsize=8)
+            f"#{idx}  p={sun_present:.2f} c={confidence:.2f}{status}\n"
+            f"{rec['scene_type']}", fontsize=8)
         ax.set_xticks([]); ax.set_yticks([])
 
     # Unused cells (when len(indices) < n_cells).
@@ -176,7 +190,7 @@ def main():
         row, col = divmod(ax_idx, args.grid_width)
         axes[row][col].axis('off')
 
-    legend = "red + = CNN centroid   grey + = below threshold"
+    legend = "red + = CNN centroid   grey + = presence below threshold"
     if args.show_truth:
         legend += "   green + = ground truth"
     fig.suptitle(legend, fontsize=9, y=0.995)
